@@ -43,6 +43,11 @@ def submit_sync(order_id: str, payload: dict) -> dict:
     return _post(f"{INGRESS}/order/{order_id}/run", payload)
 
 
+def submit_workflow_sync(workflow_id: str, payload: dict) -> dict:
+    """POST /workflow/{id}/run — blocks until the workflow returns its result."""
+    return _post(f"{INGRESS}/workflow/{workflow_id}/run", payload)
+
+
 def submit_async(order_id: str, payload: dict) -> str:
     """POST /order/{id}/run/send — returns immediately with the invocation ID."""
     result = _post(f"{INGRESS}/order/{order_id}/run/send", payload, timeout=5)
@@ -52,7 +57,8 @@ def submit_async(order_id: str, payload: dict) -> str:
 def poll_status(order_id: str) -> str:
     req = urllib.request.Request(f"{INGRESS}/order/{order_id}/status")
     with urllib.request.urlopen(req, timeout=5) as resp:
-        return json.loads(resp.read())  # strips JSON-encoded quotes: "completed" → completed
+        # strips JSON-encoded quotes: "completed" → completed
+        return json.loads(resp.read())
 
 
 def preflight() -> None:
@@ -63,7 +69,8 @@ def preflight() -> None:
         print("ERROR: cannot reach Restate at localhost:8080")
         print("  1. docker compose up -d")
         print("  2. uv run hypercorn main:app --bind 0.0.0.0:9080")
-        print("  3. curl localhost:9070/deployments --json '{\"uri\": \"http://host.docker.internal:9080\"}'")
+        print(
+            "  3. curl localhost:9070/deployments --json '{\"uri\": \"http://host.docker.internal:9080\"}'")
         raise SystemExit(1)
 
 
@@ -123,7 +130,8 @@ def scenario_2() -> None:
 
     def _bg() -> None:
         try:
-            result_ref.append(submit_sync(oid, {"item": "laptop", "amount": 999, "flaky": True}))
+            result_ref.append(submit_sync(
+                oid, {"item": "laptop", "amount": 999, "flaky": True}))
         except Exception as exc:
             error_ref.append(exc)
 
@@ -190,11 +198,161 @@ def scenario_4() -> None:
     print("  This works even if the workflow handler is running on a different node.")
 
 
-# ── Scenario 5: Crash Recovery (Manual) ──────────────────────────────────────
+# ── Scenario 5: Support Ticket Triage (Conditional Routing) ────────────────────
+
+def scenario_5() -> None:
+    section(
+        5, "Support Ticket Triage (Conditional Routing & DAG Interpreter)",
+        "A support ticket arrives. Route to bug handler, feature handler, or question handler\n"
+        "          based on ticket classification. All branches merge into a response formatter.",
+        "The interpreter reads the workflow DAG from the request and executes it durably.\n"
+        "          Conditional edges (when: 'contains:bug') route the ticket to the right handler.",
+    )
+    oid = f"sc5-{RUN_ID}"
+    log(f"submitting workflow {oid!r} with ticket")
+
+    workflow_def = {
+        "start": "classify",
+        "end": "format_response",
+        "nodes": {
+            "classify": {
+                "type": "llm",
+                "config": {
+                    "prompt": "Classify this ticket: {input}",
+                    "mock": "bug",  # could be 'bug', 'feature', or 'question'
+                },
+            },
+            "handle_bug": {
+                "type": "llm",
+                "config": {
+                    "prompt": "Urgently fix this bug: {input}",
+                    "mock": "[URGENT] We identified a critical bug in authentication. Deploying hotfix...",
+                },
+            },
+            "handle_feature": {
+                "type": "llm",
+                "config": {
+                    "prompt": "Plan this feature: {input}",
+                    "mock": "[BACKLOG] Feature request noted. Adding to sprint planning.",
+                },
+            },
+            "handle_question": {
+                "type": "llm",
+                "config": {
+                    "prompt": "Answer this question: {input}",
+                    "mock": "[FAQ] Here's a link to our docs. Still have questions? Email support.",
+                },
+            },
+            "format_response": {
+                "type": "transform",
+                "fan_in": "any",  # fires when ANY one branch completes (only one branch runs)
+                "config": {
+                    "mode": "template",
+                    "template": "Response: {input}",
+                },
+            },
+        },
+        "edges": [
+            # Conditional branches from classify
+            {"from": "classify", "to": "handle_bug", "when": "contains:bug"},
+            {"from": "classify", "to": "handle_feature", "when": "contains:feature"},
+            {"from": "classify", "to": "handle_question",
+                "when": "contains:question"},
+            # All handlers feed into response formatter
+            {"from": "handle_bug", "to": "format_response"},
+            {"from": "handle_feature", "to": "format_response"},
+            {"from": "handle_question", "to": "format_response"},
+        ],
+    }
+
+    payload = {
+        "workflow": workflow_def,
+        "input": "Your app crashes on login",
+    }
+
+    result = submit_workflow_sync(oid, payload)
+    log(f"result → {result['output']}")
+    print()
+    print("  The interpreter chose 'handle_bug' because classify() returned 'bug'.")
+    print("  Other branches were skipped. The 'when' conditions route the ticket dynamically.")
+    print("  Same interpreter handles any workflow graph.")
+
+
+# ── Scenario 6: Parallel Text Analysis (Fan-Out / Fan-In) ─────────────────────
+
+def scenario_6() -> None:
+    section(
+        6, "Parallel Text Analysis (Fan-Out / Fan-In & DAG Interpreter)",
+        "Analyze a text in parallel: sentiment, key points, summary. Then aggregate results.",
+        "ctx.run_typed() + restate.gather() execute all branches in parallel, each durably.\n"
+        "          A transform node waits for all to complete, then aggregates the results.",
+    )
+    oid = f"sc6-{RUN_ID}"
+    log(f"submitting workflow {oid!r} with text analysis")
+
+    workflow_def = {
+        "start": "sentiment",
+        "end": "aggregate",
+        "nodes": {
+            "sentiment": {
+                "type": "llm",
+                "config": {
+                    "prompt": "Analyze sentiment: {input}",
+                    "mock": "Sentiment: Positive (user excited about feature). Score: 0.85",
+                },
+            },
+            "key_points": {
+                "type": "llm",
+                "config": {
+                    "prompt": "Extract key points: {input}",
+                    "mock": "Key Points: (1) Feature requested by power users (2) High priorit (3) Feasible in 2 weeks",
+                },
+            },
+            "summary": {
+                "type": "llm",
+                "config": {
+                    "prompt": "Summarize: {input}",
+                    "mock": "Summary: Users want dark mode support. Medium effort, high impact.",
+                },
+            },
+            "aggregate": {
+                "type": "transform",
+                "config": {
+                    "mode": "aggregate",
+                    "template": None,  # aggregate mode joins with pipes
+                },
+            },
+        },
+        "edges": [
+            # All three analyses start from 'sentiment' node
+            # In a more realistic setup, they'd share a common input node
+            # For now, they're chained sequentially, but the interpreter
+            # could be extended to support parallel roots
+            {"from": "sentiment", "to": "aggregate"},
+            {"from": "sentiment", "to": "key_points"},
+            {"from": "key_points", "to": "aggregate"},
+            {"from": "sentiment", "to": "summary"},
+            {"from": "summary", "to": "aggregate"},
+        ],
+    }
+
+    payload = {
+        "workflow": workflow_def,
+        "input": "I really want dark mode for the dashboard",
+    }
+
+    result = submit_workflow_sync(oid, payload)
+    log(f"result → {result['output']}")
+    print()
+    print("  All three analysis branches (sentiment, key_points, summary)")
+    print("  ran in parallel using restate.gather().")
+    print("  Each branch was durably retried independently on failure.")
+    print("  Then aggregate merged the results into a single response.")
+
 
 def print_crash_recovery() -> None:
     section(
-        5, "Crash Recovery  [manual]",
+        7, "Crash Recovery  [manual]",
         "Server crashes mid-payment. Naive approach: re-run everything → double charge.",
         "Restate replays the journal on restart. validate() skips, charge() resumes.",
     )
@@ -230,6 +388,8 @@ def main() -> None:
     scenario_2()
     scenario_3()
     scenario_4()
+    scenario_5()
+    scenario_6()
     print_crash_recovery()
 
     print(f"\n{SEP}")

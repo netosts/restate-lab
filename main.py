@@ -2,6 +2,8 @@ import time
 import restate
 from restate import Workflow, WorkflowContext, WorkflowSharedContext
 
+from interpreter import interpreter
+
 _charge_attempts: dict[str, int] = {}
 
 order = Workflow("order")
@@ -42,11 +44,12 @@ def charge(order_id: str, amount: int, *, flaky: bool = False) -> str:
     print(f"  [charge] order={order_id!r} amount=${amount} attempt={attempt}")
     if flaky and attempt <= 2:
         backoff_ms = 500 * (2 ** (attempt - 1))
-        print(f"  [charge] gateway timeout — Restate retries in {backoff_ms}ms")
+        print(
+            f"  [charge] gateway timeout — Restate retries in {backoff_ms}ms")
         raise Exception("Payment gateway timeout")
     tx_id = f"tx-{order_id}"
     print(f"  [charge] charged ${amount} ✓  tx_id={tx_id}")
     return tx_id
 
 
-app = restate.app(services=[order])
+app = restate.app(services=[order, interpreter])
